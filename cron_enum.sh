@@ -5,7 +5,7 @@
 # Authorized lab / OSCP use on your own provisioned instances only. Read-only:
 # makes no changes, runs fine as an unprivileged user.
 #
-# It does three things:
+# It does four things:
 #   1. Dumps every cron source on the box (system, per-user, systemd timers).
 #   2. Lists directories/files the current user can write to.
 #   3. Cross-references the two and AUTO-FLAGS any scheduled job that is
@@ -17,6 +17,9 @@
 #      It also READS INSIDE each referenced script and follows the files it
 #      calls or sources (up to 3 levels), so a root-owned job that pulls in a
 #      writable helper/config down the chain still gets flagged.
+#   4. Shows the NEXT FIRE TIME for every job (e.g. "next: in 3m") so you know
+#      which one to target first. Exact time needs python3/python on the box;
+#      without it, falls back to a plain-text schedule description.
 #
 # Usage:  bash cron-enum.sh            # full run
 #         bash cron-enum.sh --no-find  # skip the slow  find /  writable sweep
@@ -38,6 +41,54 @@ MYID=$(id 2>/dev/null)
 # cron PATH used for relative-command / PATH-hijack checks
 CRON_PATH=$(grep -E '^\s*PATH=' /etc/crontab 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d '"')
 [ -z "$CRON_PATH" ] && CRON_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# interpreter for exact next-run calculation (falls back to a text description)
+have_py=""
+command -v python3 >/dev/null 2>&1 && have_py=python3
+[ -z "$have_py" ] && command -v python >/dev/null 2>&1 && have_py=python
+
+PYNEXT=$(cat <<'PYEOF'
+import sys,datetime
+mn,hr,dom,mon,dow=sys.argv[1:6]
+NM={'jan':1,'feb':2,'mar':3,'apr':4,'may':5,'jun':6,'jul':7,'aug':8,'sep':9,'oct':10,'nov':11,'dec':12}
+ND={'sun':0,'mon':1,'tue':2,'wed':3,'thu':4,'fri':5,'sat':6}
+def parse(f,lo,hi,names=None):
+    s=set()
+    if names:
+        fl=f.lower()
+        for k,v in names.items(): fl=fl.replace(k,str(v))
+        f=fl
+    for part in f.split(','):
+        step=1; rng=part
+        if '/' in part: rng,st=part.split('/'); step=int(st)
+        if rng=='*' or rng=='': a,b=lo,hi
+        elif '-' in rng: aa,bb=rng.split('-'); a=int(aa); b=int(bb)
+        else: a=b=int(rng)
+        x=a
+        while x<=b: s.add(x); x+=step
+    return s
+try:
+    mins=parse(mn,0,59); hrs=parse(hr,0,23); doms=parse(dom,1,31)
+    mons=parse(mon,1,12,NM); dows=parse(dow,0,7,ND)
+except Exception:
+    print("?"); sys.exit(0)
+if 7 in dows: dows.add(0)
+dr=dom.strip()!='*'; wr=dow.strip()!='*'
+now=datetime.datetime.now().replace(second=0,microsecond=0)
+t=now+datetime.timedelta(minutes=1); limit=t+datetime.timedelta(days=366*4); hit=None
+while t<=limit:
+    if t.minute in mins and t.hour in hrs and t.month in mons:
+        wd=(t.weekday()+1)%7; dm=t.day in doms; dw=wd in dows
+        ok=(dm or dw) if (dr and wr) else (dm if dr else (dw if wr else True))
+        if ok: hit=t; break
+    t+=datetime.timedelta(minutes=1)
+if hit is None: print("unknown"); sys.exit(0)
+secs=int((hit-now).total_seconds())
+d,r=divmod(secs,86400); h,r=divmod(r,3600); m,_=divmod(r,60)
+short=("in %dd%dh"%(d,h)) if d else (("in %dh%dm"%(h,m)) if h else ("in %dm"%m))
+print("%s\t%s"%(short,hit.strftime("%a %Y-%m-%d %H:%M")))
+PYEOF
+)
 
 FINDINGS=()   # each entry: "SEV|location|note"
 SEEN_SCRIPTS=" "   # visited-file guard for recursive script following
@@ -92,9 +143,11 @@ follow_script() {
         examine "$tok" "$ctx -> sourced by $f" "$((depth+1))"
         continue ;;
     esac
+    set -f
     for tok in $sl; do                            # any path-looking token it calls
       case "$tok" in */*) examine "$tok" "$ctx -> called by $f" "$((depth+1))" ;; esac
     done
+    set +f
   done < "$f"
 }
 
@@ -108,14 +161,56 @@ examine() {
   [ -f "$q" ] && [ -r "$q" ] && follow_script "$q" "$ctx" "$depth"
 }
 
+# best-effort schedule description when no interpreter is available
+human_sched() {
+  local m=$1 h=$2 dom=$3 mon=$4 dow=$5
+  case "$m" in */*) [ "$h $dom $mon $dow" = "* * * *" ] && { echo "every ${m#*/}m"; return; } ;; esac
+  if [ "$dom $mon $dow" = "* * *" ] && [ "$m" != "*" ] && [ "$h" != "*" ]; then
+    printf 'daily %s:%s\n' "$h" "$m"; return
+  fi
+  echo "sched: $m $h $dom $mon $dow"
+}
+
+# next fire time for a schedule.  Prints "SHORT<TAB>ABS"  (or a plain string).
+next_run() {
+  local sched="$1" out
+  case "$sched" in
+    @reboot)            echo "at reboot"; return ;;
+    @yearly|@annually)  set -- 0 0 1 1 '*' ;;
+    @monthly)           set -- 0 0 1 '*' '*' ;;
+    @weekly)            set -- 0 0 '*' '*' 0 ;;
+    @daily|@midnight)   set -- 0 0 '*' '*' '*' ;;
+    @hourly)            set -- 0 '*' '*' '*' '*' ;;
+    @*)                 echo "$sched"; return ;;
+    *)                  set -f; set -- $sched; set +f ;;
+  esac
+  [ -z "${5:-}" ] && { echo "?"; return; }
+  if [ -n "$have_py" ]; then
+    out=$("$have_py" -c "$PYNEXT" "$1" "$2" "$3" "$4" "$5" 2>/dev/null)
+    case "$out" in ""|unknown|\?) ;; *) printf '%s' "$out"; return ;; esac
+  fi
+  human_sched "$1" "$2" "$3" "$4" "$5"
+}
+
 # analyse one raw cron line.  $1=source label  $2=1 if it has a user field  $3=line
 analyze_line() {
   local src="$1" has_user="$2" line="$3"
-  local runas cmd first tok
+  local runas cmd first tok sched nr_raw nr_short nr_abs nsuf
 
   line="${line#"${line%%[![:space:]]*}"}"           # ltrim
   case "$line" in ""|\#*) return ;; esac            # blank / comment
   case "$line" in PATH=*|SHELL=*|MAILTO=*|HOME=*|LOGNAME=*) return ;; esac
+
+  # when does it next fire?
+  if [ "${line:0:1}" = "@" ]; then
+    sched=$(awk '{print $1}' <<<"$line")
+  else
+    sched=$(awk '{print $1,$2,$3,$4,$5}' <<<"$line")
+  fi
+  nr_raw=$(next_run "$sched")
+  nr_short=${nr_raw%%$'\t'*}
+  nr_abs=${nr_raw#*$'\t'}
+  [ "$nr_abs" = "$nr_raw" ] && nr_abs=""            # no tab -> no absolute time
 
   # split off schedule fields to isolate USER (if any) + command
   if [ "${line:0:1}" = "@" ]; then                  # @reboot / @daily style
@@ -134,19 +229,23 @@ analyze_line() {
   [ -z "$cmd" ] && return
 
   # highlight the raw entry (root jobs are the prize)
+  nsuf="  ${GRN}next: ${nr_short}${RST}"
+  [ -n "$nr_abs" ] && nsuf="$nsuf ${DIM}(${nr_abs})${RST}"
   if [ "$runas" = "root" ]; then
-    printf '  %s[%s]%s runas=%s%s%s  %s\n' "$DIM" "$src" "$RST" "$RED" "$runas" "$RST" "$cmd"
+    printf '  %s[%s]%s runas=%s%s%s  %s%s\n' "$DIM" "$src" "$RST" "$RED" "$runas" "$RST" "$cmd" "$nsuf"
   else
-    printf '  %s[%s]%s runas=%s  %s\n' "$DIM" "$src" "$RST" "$runas" "$cmd"
+    printf '  %s[%s]%s runas=%s  %s%s\n' "$DIM" "$src" "$RST" "$runas" "$cmd" "$nsuf"
   fi
 
   # 1) writability of every path-looking token, following into called/sourced files
-  for tok in $cmd; do examine "$tok" "$src runas=$runas" 0; done
+  set -f
+  for tok in $cmd; do examine "$tok" "$src runas=$runas next=$nr_short" 0; done
+  set +f
 
   # 2) wildcard / argument injection
   case "$cmd" in
     *tar\ *\**|*rsync\ *\**|*7z*\**|*zip\ *\**|*chown\ *\**|*chmod\ *\**|*scp\ *\**|*wget\ *\**|*rar\ *\**)
-      add_finding "HIGH" "$src" "wildcard (*) in job runas=$runas: '$cmd' - possible wildcard/arg injection" ;;
+      add_finding "HIGH" "$src" "wildcard (*) in job runas=$runas next=$nr_short: '$cmd' - possible wildcard/arg injection" ;;
   esac
 
   # 3) relative command name -> PATH hijack if any cron PATH dir is writable
@@ -159,7 +258,7 @@ analyze_line() {
       IFS=':' read -ra _pd <<<"$CRON_PATH"
       for d in "${_pd[@]}"; do
         [ -n "$d" ] && [ -d "$d" ] && [ -w "$d" ] && \
-          add_finding "HIGH" "$d" "job runas=$runas calls '$first' via PATH; $d is writable - PATH hijack"
+          add_finding "HIGH" "$d" "job runas=$runas next=$nr_short calls '$first' via PATH; $d is writable - PATH hijack"
       done ;;
   esac
 }
@@ -215,7 +314,7 @@ for f in /etc/cron.d/*; do [ -f "$f" ] && scan_file "$f" 1 "cron.d/$(basename "$
 for f in /var/spool/cron/crontabs/* /var/spool/cron/*; do
   [ -f "$f" ] && scan_file "$f" 0 "spool/$(basename "$f")"
 done
-crontab -l 2>/dev/null | while IFS= read -r l; do analyze_line "crontab -l ($ME)" 0 "$l"; done
+while IFS= read -r l; do analyze_line "crontab -l ($ME)" 0 "$l"; done < <(crontab -l 2>/dev/null)
 
 # scripts dropped in the periodic run-parts dirs
 for dir in /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly; do
@@ -233,7 +332,9 @@ if command -v systemctl >/dev/null 2>&1; then
     svc="${unit%.timer}.service"
     exec_line=$(systemctl cat "$svc" 2>/dev/null | grep -E '^\s*ExecStart=' | head -n1 | cut -d= -f2-)
     [ -z "$exec_line" ] && continue
+    set -f
     for tok in $exec_line; do examine "$tok" "systemd timer $unit" 0; done
+    set +f
   done < <(systemctl list-timers --all --no-pager 2>/dev/null | awk '/\.timer/{for(i=1;i<=NF;i++) if($i ~ /\.timer$/) print $i}')
 fi
 
