@@ -14,6 +14,9 @@
 #        - writable directory holding that script (delete + replace)
 #        - relative command + writable PATH dir   (PATH hijack)
 #        - wildcard (*) in the command            (argument/wildcard injection)
+#      It also READS INSIDE each referenced script and follows the files it
+#      calls or sources (up to 3 levels), so a root-owned job that pulls in a
+#      writable helper/config down the chain still gets flagged.
 #
 # Usage:  bash cron-enum.sh            # full run
 #         bash cron-enum.sh --no-find  # skip the slow  find /  writable sweep
@@ -37,6 +40,9 @@ CRON_PATH=$(grep -E '^\s*PATH=' /etc/crontab 2>/dev/null | tail -n1 | cut -d= -f
 [ -z "$CRON_PATH" ] && CRON_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 FINDINGS=()   # each entry: "SEV|location|note"
+SEEN_SCRIPTS=" "   # visited-file guard for recursive script following
+
+already_seen() { case "$SEEN_SCRIPTS" in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
 hr()   { printf '%s\n' "${DIM}--------------------------------------------------------------------------${RST}"; }
 sect() { printf '\n%s\n' "${CYN}${BLD}== $* ==${RST}"; }
@@ -66,6 +72,40 @@ report_path() {
     [ -n "$d" ] && [ -d "$d" ] && [ -w "$d" ] && \
       add_finding "HIGH" "$d/" "$p (run by [$ctx]) is missing but its dir is writable - create it"
   fi
+}
+
+# Read INSIDE a referenced script/config and inspect what IT calls or sources,
+# so a clean top-level script that pulls in a writable file still gets flagged.
+# Recurses up to 3 levels; skips binaries and already-seen files.
+follow_script() {
+  local f="$1" ctx="$2" depth="${3:-0}" sl tok
+  [ "$depth" -ge 3 ] && return
+  already_seen "$f" && return
+  SEEN_SCRIPTS="$SEEN_SCRIPTS$f "
+  grep -Iq . "$f" 2>/dev/null || return          # skip binaries / empty files
+  while IFS= read -r sl || [ -n "$sl" ]; do
+    sl="${sl#"${sl%%[![:space:]]*}"}"            # ltrim
+    case "$sl" in ""|\#*) continue ;; esac
+    case "$sl" in
+      .\ *|source\ *)                             # sourced config / library
+        tok=$(awk '{print $2}' <<<"$sl")
+        examine "$tok" "$ctx -> sourced by $f" "$((depth+1))"
+        continue ;;
+    esac
+    for tok in $sl; do                            # any path-looking token it calls
+      case "$tok" in */*) examine "$tok" "$ctx -> called by $f" "$((depth+1))" ;; esac
+    done
+  done < "$f"
+}
+
+# Check a token for writability AND, if it is a readable script/config, follow it.
+examine() {
+  local p="$1" ctx="$2" depth="${3:-0}" q
+  report_path "$p" "$ctx"
+  q="$p"; q="${q%\"}"; q="${q#\"}"; q="${q%\'}"; q="${q#\'}"
+  q="${q#>}"; q="${q#>}"; q="${q#<}"; q="${q#|}"
+  case "$q" in */*) ;; *) return ;; esac
+  [ -f "$q" ] && [ -r "$q" ] && follow_script "$q" "$ctx" "$depth"
 }
 
 # analyse one raw cron line.  $1=source label  $2=1 if it has a user field  $3=line
@@ -100,8 +140,8 @@ analyze_line() {
     printf '  %s[%s]%s runas=%s  %s\n' "$DIM" "$src" "$RST" "$runas" "$cmd"
   fi
 
-  # 1) writability of every path-looking token in the command
-  for tok in $cmd; do report_path "$tok" "$src runas=$runas"; done
+  # 1) writability of every path-looking token, following into called/sourced files
+  for tok in $cmd; do examine "$tok" "$src runas=$runas" 0; done
 
   # 2) wildcard / argument injection
   case "$cmd" in
@@ -182,7 +222,7 @@ for dir in /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly; 
   [ -d "$dir" ] || continue
   for s in "$dir"/*; do
     [ -e "$s" ] || continue
-    report_path "$s" "run-parts $dir (root)"
+    examine "$s" "run-parts $dir (root)" 0
   done
 done
 
@@ -193,7 +233,7 @@ if command -v systemctl >/dev/null 2>&1; then
     svc="${unit%.timer}.service"
     exec_line=$(systemctl cat "$svc" 2>/dev/null | grep -E '^\s*ExecStart=' | head -n1 | cut -d= -f2-)
     [ -z "$exec_line" ] && continue
-    for tok in $exec_line; do report_path "$tok" "systemd timer $unit"; done
+    for tok in $exec_line; do examine "$tok" "systemd timer $unit" 0; done
   done < <(systemctl list-timers --all --no-pager 2>/dev/null | awk '/\.timer/{for(i=1;i<=NF;i++) if($i ~ /\.timer$/) print $i}')
 fi
 
